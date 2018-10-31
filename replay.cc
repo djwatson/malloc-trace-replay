@@ -19,6 +19,7 @@
 
 #include "instruction.h"
 
+
 #include "fd-input-mapper.h"
 
 #ifdef __GNUC__
@@ -34,6 +35,46 @@ struct ThreadCacheState;
 extern "C" {
   bool release_malloc_thread_cache(ThreadCacheState** place_state_here) __attribute__((weak));
   bool set_malloc_thread_cache(ThreadCacheState* state) __attribute__((weak));
+}
+
+extern "C" {
+  extern "C" void* mallocx(size_t, int) __attribute__((__weak__));
+  extern "C" void* rallocx(void*, size_t, int) __attribute__((__weak__));
+  extern "C" void dallocx(void*, int) __attribute__((__weak__));
+  extern "C" void sdallocx(void*, size_t, int) __attribute__((__weak__));
+  extern "C" int mallctl(const char*, void*, size_t*, void*, size_t)
+    __attribute__((__weak__));
+}
+
+static bool using_jemalloc = false;
+
+void check_jemalloc() {
+  if (mallocx == NULL || rallocx == NULL || dallocx == NULL
+      || sdallocx == NULL || mallctl == NULL) {
+    using_jemalloc = false;
+    return;
+  }
+  if (getenv("NO_THREAD_CACHE_SWITCH")) {
+    using_jemalloc = false;
+    return;
+  }
+
+  using_jemalloc = true;
+}
+
+static int create_je_tcache() {
+  int cacheId_ = -1;
+  size_t len = sizeof(cacheId_);
+  auto ret = mallctl("tcache.create", &cacheId_, &len, nullptr, 0);
+  assert(ret != EFAULT);
+  assert(cacheId_ != -1);
+  return cacheId_;
+}
+
+static void destroy_je_tcache(int id) {
+  size_t len = sizeof(id);
+  auto ret = mallctl("tcache.destroy", &id, &len, nullptr, 0);
+  assert(ret != EFAULT);
 }
 
 static auto release_malloc_thread_cache_ptr = release_malloc_thread_cache;
@@ -83,6 +124,28 @@ static std::unordered_map<uint64_t, ThreadCacheState*> thread_states;
 static constexpr uint64_t kInvalidThreadId = static_cast<uint64_t>(int64_t{-1});
 static uint64_t current_thread_id = kInvalidThreadId;
 
+#define MALLOCX_TCACHE(tc)      ((int)(((tc)+2) << 8))
+static std::unordered_map<uint64_t, int> je_tcaches;
+static int current_tcache_id = -1;
+
+static void* do_malloc(size_t sz) {
+  if (using_jemalloc) {
+    assert(current_tcache_id >= 0);
+    return mallocx(sz, MALLOCX_TCACHE(current_tcache_id));
+  } else {
+    return malloc(sz);
+  }
+}
+
+static void do_free(void* ptr) {
+  if (using_jemalloc) {
+    //assert(current_tcache_id >= 0);
+    dallocx(ptr, MALLOCX_TCACHE(current_tcache_id));
+  } else {
+    free(ptr);
+  }
+}
+
 static void delete_malloc_state(ThreadCacheState* malloc_state) {
   ThreadCacheState *old{};
   release_malloc_thread_cache(&old);
@@ -99,25 +162,43 @@ static void handle_switch_thread(uint64_t thread_id) {
   assert(current_thread_id != thread_id);
   assert(thread_id != kInvalidThreadId);
 
-  ThreadCacheState* ts;
-  release_malloc_thread_cache(&ts);
-  thread_states[current_thread_id] = ts;
+  if (using_jemalloc) {
+    current_thread_id = thread_id;
+    if (je_tcaches.count(current_thread_id) == 0) {
+      int newtcache = create_je_tcache();
+      je_tcaches.insert(std::make_pair(current_thread_id,newtcache));
+    }
+    current_tcache_id = je_tcaches[current_thread_id];
+    assert(current_tcache_id >= 0);
+  } else {
+    ThreadCacheState* ts;
+    release_malloc_thread_cache(&ts);
+    thread_states[current_thread_id] = ts;
 
-  current_thread_id = thread_id;
-  ts = thread_states[current_thread_id];
-  if (ts != nullptr) {
-    set_malloc_thread_cache(ts);
+    current_thread_id = thread_id;
+    ts = thread_states[current_thread_id];
+    if (ts != nullptr) {
+      set_malloc_thread_cache(ts);
+    }
   }
 
   thread_switches++;
 }
 
 static void handle_kill_thread() {
-  assert(current_thread_id != kInvalidThreadId);
-  ThreadCacheState* ts = thread_states[current_thread_id];
-  thread_states.erase(current_thread_id);
-  if (ts != nullptr) {
-    delete_malloc_state(ts);
+  if (using_jemalloc) {
+    assert(current_thread_id != kInvalidThreadId);
+    int it = je_tcaches[current_thread_id];
+    je_tcaches.erase(current_thread_id);
+    destroy_je_tcache(it);
+    current_tcache_id = -1;
+  } else {
+    assert(current_thread_id != kInvalidThreadId);
+    ThreadCacheState* ts = thread_states[current_thread_id];
+    thread_states.erase(current_thread_id);
+    if (ts != nullptr) {
+      delete_malloc_state(ts);
+    }
   }
   current_thread_id = kInvalidThreadId;
 }
@@ -130,7 +211,7 @@ static void replay_instruction(const Instruction& i) {
   auto reg = i.reg;
   switch (i.type) {
   case Instruction::Type::MALLOC: {
-    auto ptr = malloc(i.malloc.size);
+    auto ptr = do_malloc(i.malloc.size);
     //printf("%lld = malloc(%lld)\n", (long long)reg, (long long)(i.malloc.size));
     if (ptr == nullptr) {
       abort();
@@ -157,13 +238,14 @@ static void replay_instruction(const Instruction& i) {
       asm volatile ("int $3");
     }
     assert(registers[reg] != nullptr);
-    free(registers[reg]);
+    do_free(registers[reg]);
     registers[reg] = nullptr;
     allocated_count--;
     break;
   }
   case Instruction::Type::MEMALIGN: {
     allocated_count++;
+    //TODO
     auto ptr = memalign(i.malloc.align, i.malloc.size);
     if (ptr == nullptr) {
       abort();
@@ -182,6 +264,7 @@ static void replay_instruction(const Instruction& i) {
     auto old_reg = reg;
     auto new_reg = i.realloc.new_reg;
     assert(registers[old_reg] != nullptr);
+    // TODO
     auto ptr = realloc(registers[old_reg], i.realloc.new_size);
     if (ptr == nullptr) {
       abort();
@@ -196,7 +279,7 @@ static void replay_instruction(const Instruction& i) {
 #if 0
     tc_free_sized(registers[reg], i.malloc.size);
 #else
-    free(registers[reg]);
+    do_free(registers[reg]);
 #endif
     registers[reg] = nullptr;
     break;
@@ -310,6 +393,7 @@ static inline __attribute__((always_inline)) bool buffer_read(int fd, void* ptr,
 }
 
 int main(int argc, char **argv) {
+  check_jemalloc();
   mmap_registers();
   setup_malloc_state_fns();
 
@@ -338,7 +422,7 @@ int main(int argc, char **argv) {
     });
 
   printf("will%s use set/release_malloc_thread_cache\n",
-         set_malloc_thread_cache_ptr ? "" : " not");
+         (set_malloc_thread_cache_ptr || using_jemalloc) ? "" : " not");
 
   uint64_t nanos_start = nanos();
   uint64_t printed_instructions = 0;
@@ -372,7 +456,7 @@ int main(int argc, char **argv) {
       printf("\rtotal_instructions = %lld; rate = %f ops/sec; live threads: %d; ~last reg: %d         \b\b\b\b\b\b\b\b\b",
              (long long)total_instructions,
              (double)total_instructions * 1E9 / total_nanos,
-             (int)thread_states.size(),
+             using_jemalloc ? (int)je_tcaches.size() : (int)thread_states.size(),
              (int)next_instr.reg);
       fflush(stdout);
     }
@@ -389,6 +473,14 @@ int main(int argc, char **argv) {
   printf("total ts updates %zu\n", ts_updates);
 
   printf("allocated still: %llu\n", (unsigned long long)allocated_count);
+
+  if(using_jemalloc) {
+    // Must destroy last tcache TODO?
+    int tcache = je_tcaches[0];
+    je_tcaches.erase(0);
+    destroy_je_tcache(tcache);
+  }
+
 
   return 0;
 }
