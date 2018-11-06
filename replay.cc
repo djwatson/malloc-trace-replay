@@ -47,6 +47,23 @@ extern "C" {
 }
 
 static bool using_jemalloc = false;
+static unsigned narenas;
+static unsigned next_arena = 0;
+static std::vector<unsigned> thr_cnt;
+
+unsigned choose_arena() {
+  unsigned cnt = 100; // TODO
+  unsigned arena = 0;
+  for (int i =0; i < narenas; i++) {
+    if (thr_cnt[i] < cnt) {
+      arena = i;
+      cnt = thr_cnt[i];
+    }
+  }
+
+  thr_cnt[arena]++;
+  return arena;
+}
 
 void check_jemalloc() {
   if (mallocx == NULL || rallocx == NULL || dallocx == NULL
@@ -58,6 +75,16 @@ void check_jemalloc() {
     using_jemalloc = false;
     return;
   }
+
+  size_t sz = sizeof(narenas);
+  auto ret = mallctl("arenas.narenas", &narenas, &sz, nullptr, 0);
+  assert(ret == 0);
+  assert(narenas);
+  thr_cnt.reserve(narenas);
+  for (int i = 0; i < narenas; i++) {
+    thr_cnt[i] = 0;
+  }
+
 
   using_jemalloc = true;
 }
@@ -73,7 +100,7 @@ static int create_je_tcache() {
 
 static void destroy_je_tcache(int id) {
   size_t len = sizeof(id);
-  auto ret = mallctl("tcache.destroy", &id, &len, nullptr, 0);
+  auto ret = mallctl("tcache.destroy", nullptr, 0, &id, len);
   assert(ret != EFAULT);
 }
 
@@ -125,13 +152,15 @@ static constexpr uint64_t kInvalidThreadId = static_cast<uint64_t>(int64_t{-1});
 static uint64_t current_thread_id = kInvalidThreadId;
 
 #define MALLOCX_TCACHE(tc)      ((int)(((tc)+2) << 8))
-static std::unordered_map<uint64_t, int> je_tcaches;
+#define MALLOCX_ARENA(a)        ((((int)(a))+1) << 20)
+static std::unordered_map<uint64_t, std::pair<int, unsigned>> je_tcaches;
 static int current_tcache_id = -1;
+static unsigned current_arena_id = 0;
 
 static void* do_malloc(size_t sz) {
   if (using_jemalloc) {
     assert(current_tcache_id >= 0);
-    return mallocx(sz, MALLOCX_TCACHE(current_tcache_id));
+    return mallocx(sz, MALLOCX_TCACHE(current_tcache_id) | MALLOCX_ARENA(current_arena_id));
   } else {
     return malloc(sz);
   }
@@ -140,7 +169,7 @@ static void* do_malloc(size_t sz) {
 static void do_free(void* ptr) {
   if (using_jemalloc) {
     //assert(current_tcache_id >= 0);
-    dallocx(ptr, MALLOCX_TCACHE(current_tcache_id));
+    dallocx(ptr, MALLOCX_TCACHE(current_tcache_id) | MALLOCX_ARENA(current_arena_id));
   } else {
     free(ptr);
   }
@@ -166,9 +195,11 @@ static void handle_switch_thread(uint64_t thread_id) {
     current_thread_id = thread_id;
     if (je_tcaches.count(current_thread_id) == 0) {
       int newtcache = create_je_tcache();
-      je_tcaches.insert(std::make_pair(current_thread_id,newtcache));
+      unsigned arena = choose_arena();
+      je_tcaches.insert(std::make_pair(current_thread_id,std::make_pair(newtcache, arena)));
     }
-    current_tcache_id = je_tcaches[current_thread_id];
+    current_tcache_id = je_tcaches[current_thread_id].first;
+    current_arena_id = je_tcaches[current_thread_id].second;
     assert(current_tcache_id >= 0);
   } else {
     ThreadCacheState* ts;
@@ -188,7 +219,9 @@ static void handle_switch_thread(uint64_t thread_id) {
 static void handle_kill_thread() {
   if (using_jemalloc) {
     assert(current_thread_id != kInvalidThreadId);
-    int it = je_tcaches[current_thread_id];
+    int it = je_tcaches[current_thread_id].first;
+    unsigned arena = je_tcaches[current_thread_id].second;
+    thr_cnt[arena]--;
     je_tcaches.erase(current_thread_id);
     destroy_je_tcache(it);
     current_tcache_id = -1;
@@ -473,14 +506,6 @@ int main(int argc, char **argv) {
   printf("total ts updates %zu\n", ts_updates);
 
   printf("allocated still: %llu\n", (unsigned long long)allocated_count);
-
-  if(using_jemalloc) {
-    // Must destroy last tcache TODO?
-    int tcache = je_tcaches[0];
-    je_tcaches.erase(0);
-    destroy_je_tcache(tcache);
-  }
-
 
   return 0;
 }
